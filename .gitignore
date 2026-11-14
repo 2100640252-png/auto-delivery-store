@@ -2,3 +2,4 @@
 __pycache__/
 data/store.db
 data/secret.key
+data/screenshots/

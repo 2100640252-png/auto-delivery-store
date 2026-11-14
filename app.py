@@ -19,9 +19,10 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 FILES_DIR = DATA_DIR / "files"
 QR_DIR = DATA_DIR / "qr"
+SCREENSHOTS_DIR = DATA_DIR / "screenshots"
 DB_PATH = DATA_DIR / "store.db"
 SECRET_FILE = DATA_DIR / "secret.key"
-for d in (DATA_DIR, FILES_DIR, QR_DIR):
+for d in (DATA_DIR, FILES_DIR, QR_DIR, SCREENSHOTS_DIR):
 	d.mkdir(parents=True, exist_ok=True)
 def _secret_key():
 	env = os.environ.get("SECRET_KEY")
@@ -144,14 +145,14 @@ def product_detail(pid):
 		chk = "checked" if m == "wechat" else ""
 		opts += "<label><input type=\"radio\" name=\"pay_method\" value=\"" + m + "\" " + chk + "> " + label + qr + "<br><span class=\"small\">收款地址：" + addr + "</span></label><br>"
 	body = "<div class=\"card\"><h3>" + p["name"] + " — ¥" + str(p["price_yuan"]) + "</h3><p>" + p["description"] + "</p><p class=\"small\">标准价 ¥" + str(p["price_yuan"]) + " · 加急 +¥" + str(RUSH_FEE) + "（总价 ¥" + str(p["price_yuan"] + RUSH_FEE) + "）</p></div>"
-	body += "<form method=\"post\" action=\"/order\"><input type=\"hidden\" name=\"product_id\" value=\"" + str(p["id"]) + "\">"
+	body += "<form method=\"post\" action=\"/order\" enctype=\"multipart/form-data\"><input type=\"hidden\" name=\"product_id\" value=\"" + str(p["id"]) + "\">"
 	body += "<label><input type=\"checkbox\" name=\"rush\" value=\"1\"> 加急（+¥" + str(RUSH_FEE) + "）</label><br><br>"
 	body += "<b>付款方式（先扫码付款，再提交凭证）：</b><br>" + opts + "<br>"
 	body += "<label>称呼 *<input name=\"customer_name\" required></label>"
 	body += "<label>联系方式（微信/QQ/邮箱）*<input name=\"contact\" required></label>"
-	body += "<label>付款时间（可选）<input name=\"pay_time\" placeholder=\"如 2026-11-08 18:00\"></label>"
-	body += "<label>交易单号后4位（可选）<input name=\"txn_last4\" maxlength=\"4\" placeholder=\"如 1234\"></label>"
-	body += "<label>付款截图文件名（可选）<input name=\"screenshot_name\" placeholder=\"如 wechat-pay.png\"></label>"
+	body += "<label>付款时间 *<input name=\"pay_time\" required placeholder=\"如 2026-11-08 18:00\"></label>"
+	body += "<label>交易单号后4位 *<input name=\"txn_last4\" required maxlength=\"4\" placeholder=\"如 1234\"></label>"
+	body += "<label>上传付款截图（可选，图片）<input type=\"file\" name=\"screenshot\" accept=\"image/*\"></label>"
 	body += "<div class=\"warn\">提交后系统立即自动发货，订单状态为“待核实”，<b>不是付款成功</b>。商家会事后核对到账。</div>"
 	body += "<button type=\"submit\">提交订单并自动发货</button></form>"
 	return page(p["name"], body)
@@ -167,8 +168,12 @@ def create_order():
 		pay_method = "wechat"
 	name = (request.form.get("customer_name") or "").strip()
 	contact = (request.form.get("contact") or "").strip()
+	pay_time = (request.form.get("pay_time") or "").strip()
+	txn_last4 = (request.form.get("txn_last4") or "").strip()
 	if not name or not contact:
 		return page("下单失败", "<p>称呼和联系方式为必填项，请返回重新填写。</p>"), 400
+	if not pay_time or not txn_last4:
+		return page("下单失败", "<p>付款时间和交易单号后4位是必填的付款凭证，没有凭证无法自动发货。请先扫码付款，再回来填写。</p>"), 400
 	conn = get_db()
 	cur = conn.cursor()
 	p = cur.execute("SELECT * FROM products WHERE id=? AND active=1", (pid,)).fetchone()
@@ -178,6 +183,13 @@ def create_order():
 	amount = p["price_yuan"] + (RUSH_FEE if rush else 0)
 	order_no = gen_order_no()
 	now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+	screenshot_stored = ""
+	shot = request.files.get("screenshot")
+	if shot and shot.filename:
+		safe = secure_filename(shot.filename)
+		if safe:
+			screenshot_stored = order_no + "_" + safe
+			shot.save(str(SCREENSHOTS_DIR / screenshot_stored))
 	frow = cur.execute("SELECT * FROM delivery_files WHERE product_id=? ORDER BY id DESC LIMIT 1", (pid,)).fetchone()
 	crow = cur.execute("SELECT * FROM codes WHERE product_id=? AND used=0 ORDER BY id LIMIT 1", (pid,)).fetchone()
 	delivery_file = frow["stored_name"] if frow else ""
@@ -186,7 +198,7 @@ def create_order():
 		delivery_code = crow["code"]
 		cur.execute("UPDATE codes SET used=1, order_no=? WHERE id=?", (order_no, crow["id"]))
 	status = "待核实" if (delivery_file or delivery_code) else "缺货待处理"
-	cur.execute("INSERT INTO orders(order_no,product_id,product_name,amount_yuan,rush,pay_method,customer_name,contact,pay_time,txn_last4,screenshot_name,status,delivery_code,delivery_file,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (order_no, pid, p["name"], amount, rush, pay_method, name, contact, request.form.get("pay_time", ""), request.form.get("txn_last4", ""), request.form.get("screenshot_name", ""), status, delivery_code, delivery_file, now))
+	cur.execute("INSERT INTO orders(order_no,product_id,product_name,amount_yuan,rush,pay_method,customer_name,contact,pay_time,txn_last4,screenshot_name,status,delivery_code,delivery_file,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (order_no, pid, p["name"], amount, rush, pay_method, name, contact, pay_time, txn_last4, screenshot_stored, status, delivery_code, delivery_file, now))
 	conn.commit()
 	conn.close()
 	return redirect(url_for("order_result", order_no=order_no))
@@ -218,6 +230,11 @@ def download(order_no):
 @app.route("/qr/<filename>")
 def serve_qr(filename):
 	return send_from_directory(str(QR_DIR), secure_filename(filename))
+@app.route("/admin/screenshot/<filename>")
+def serve_screenshot(filename):
+	if not admin_logged_in():
+		return redirect(url_for("admin"))
+	return send_from_directory(str(SCREENSHOTS_DIR), secure_filename(filename))
 @app.route("/health")
 def health():
 	return jsonify({"ok": True, "pay_verify_enabled": False, "pay_verify_mode": "disabled"})
@@ -247,7 +264,8 @@ def admin():
 	prod_rows = "".join("<tr><td>" + str(p["id"]) + "</td><td>" + p["name"] + "</td><td>¥" + str(p["price_yuan"]) + "</td><td>" + p["description"] + "</td><td>" + p["delivery_type"] + "</td><td>" + ("上架" if p["active"] else "下架") + "</td></tr>" for p in products)
 	order_rows = ""
 	for o in orders:
-		order_rows += "<tr><td>" + o["order_no"] + "</td><td>" + o["product_name"] + "</td><td>¥" + str(o["amount_yuan"]) + "</td><td>" + PAY_METHODS.get(o["pay_method"], "") + "</td><td>" + o["customer_name"] + " / " + o["contact"] + "</td><td>" + o["status"] + "</td><td>" + (o["delivery_code"] or "") + "</td><td><form method=\"post\" action=\"/admin/order/" + o["order_no"] + "/verify\" style=\"display:inline\"><button>核实通过</button></form> <form method=\"post\" action=\"/admin/order/" + o["order_no"] + "/reject\" style=\"display:inline\"><button>驳回</button></form></td></tr>"
+		shot = "<a href=\"/admin/screenshot/" + o["screenshot_name"] + "\" target=\"_blank\">看截图</a>" if o["screenshot_name"] else "无截图"
+		order_rows += "<tr><td>" + o["order_no"] + "</td><td>" + o["product_name"] + "</td><td>¥" + str(o["amount_yuan"]) + "</td><td>" + PAY_METHODS.get(o["pay_method"], "") + "</td><td>" + o["customer_name"] + " / " + o["contact"] + "</td><td>" + (o["pay_time"] or "") + " · 单号后4位：" + (o["txn_last4"] or "") + " · " + shot + "</td><td>" + o["status"] + "</td><td>" + (o["delivery_code"] or "") + "</td><td><form method=\"post\" action=\"/admin/order/" + o["order_no"] + "/verify\" style=\"display:inline\"><button>核实通过</button></form> <form method=\"post\" action=\"/admin/order/" + o["order_no"] + "/reject\" style=\"display:inline\"><button>驳回</button></form></td></tr>"
 	code_rows = "".join("<tr><td>" + (c["pname"] or "") + "</td><td>" + c["code"] + "</td><td>" + ("已用(" + (c["order_no"] or "") + ")" if c["used"] else "未用") + "</td></tr>" for c in codes)
 	file_rows = "".join("<tr><td>" + (f["pname"] or "") + "</td><td>" + f["filename"] + "</td><td>" + f["stored_name"] + "</td></tr>" for f in files)
 	pay_forms = ""
@@ -265,7 +283,7 @@ def admin():
 	body += "<div class=\"card\"><h3>发货库存</h3><form method=\"post\" action=\"/admin/delivery-file\" enctype=\"multipart/form-data\"><label>商品ID<input name=\"product_id\" type=\"number\" required></label><label>上传发货文件<input type=\"file\" name=\"delivery_file\" required></label><button type=\"submit\">上传发货文件</button></form>"
 	body += "<form method=\"post\" action=\"/admin/codes/add\"><label>商品ID<input name=\"product_id\" type=\"number\" required></label><label>兑换码（每行一个）<textarea name=\"codes\" required></textarea></label><button type=\"submit\">添加兑换码</button></form>"
 	body += "<table><tr><th>商品</th><th>文件</th><th>存储名</th></tr>" + file_rows + "</table><table><tr><th>商品</th><th>兑换码</th><th>状态</th></tr>" + code_rows + "</table></div>"
-	body += "<div class=\"card\"><h3>订单（最新100条）</h3><table><tr><th>订单号</th><th>商品</th><th>金额</th><th>支付</th><th>客户</th><th>状态</th><th>兑换码</th><th>操作</th></tr>" + order_rows + "</table></div>"
+	body += "<div class=\"card\"><h3>订单（最新100条）</h3><table><tr><th>订单号</th><th>商品</th><th>金额</th><th>支付</th><th>客户</th><th>付款凭证</th><th>状态</th><th>兑换码</th><th>操作</th></tr>" + order_rows + "</table></div>"
 	return page("商家后台", body)
 @app.route("/admin/setup", methods=["POST"])
 def admin_setup():
